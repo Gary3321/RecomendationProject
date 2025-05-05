@@ -6,28 +6,20 @@ import numpy as np
 from sklearn.preprocessing import LabelEncoder
 import os
 import pickle
+import random
 from sklearn.metrics.pairwise import cosine_similarity
 
 # Dataset Preparation
 class AmazonDataset(Dataset):
-    def __init__(self, user_df, product_df, user_feature_path, product_feature_path):
+    def __init__(self, user_df, product_df, user_feature, product_feature):
         self.user_df = user_df
         self.product_df = product_df
-
-        # Label encode user_id and parent_asin
-        self.user_encoder = LabelEncoder().fit(self.user_df['user_id'])
-        self.product_encoder = LabelEncoder().fit(self.product_df['parent_asin'])
-
-        self.user_df['user_idx'] = self.user_encoder.transform(self.user_df['user_id'])
-        self.product_df['product_idx'] = self.product_encoder.transform(self.product_df['parent_asin'])
 
         self.labels = self.user_df['verified_purchase'].astype(int).values
 
         # Load user and prodcut features
-        with open(user_feature_path, "rb") as f:
-            self.user_features = pickle.load(f)
-        with open(product_feature_path, 'rb') as f:
-            self.product_features = pickle.load(f)
+        self.user_features = user_feature
+        self.product_features = product_feature
 
 
     def __len__(self):
@@ -41,10 +33,44 @@ class AmazonDataset(Dataset):
         label = self.labels[idx]
 
         # Convert features to tensors
-        user_vec = torch.tensor(self.user_features.get(user_id, np.zeros(2)), dtype=torch.float32)
-        product_vec = torch.tensor(self.product_features.get(product_id, np.zeros(4033)), dtype=torch.float32)
+        user_vec = torch.tensor(self.user_features.get(user_id, np.zeros(3)), dtype=torch.float32)
+        product_vec = torch.tensor(self.product_features.get(product_id, np.zeros(4034)), dtype=torch.float32)
 
-        return user_vec, product_vec, torch.tensor(label, dtype=torch.float)
+        return user_id, user_vec, product_vec, torch.tensor(label, dtype=torch.float), product_id
+
+def rec_collate_fn(batch, neg_k=2):
+    """
+    Batch negative sampling: sample negatives from the positive items present in this batch.
+    batch: list of tuples (u, seq_embs, seq_mask, user_emb, pos_item_emb, labels, pos_item_id)
+    """
+    user_ids, user_vec, product_vec, labels, product_ids = zip(*batch)
+    B = len(user_ids)
+
+    # stack positives
+    user_embs = torch.stack(user_vec)         # (B, D)
+    pos_item_embs = torch.stack(product_vec) # (B, D)
+    pos_labels = torch.stack(labels).view(-1)       # (B, )
+
+    # negative sampling from batch's positive items
+    neg_user_embs, neg_item_embs, neg_labels = [], [], []
+    for idx in range(B):
+        # candidate negatives: all other pos_item_ids in batch
+        candidates = [j for j in range(B) if j != idx]
+        for _ in range(neg_k):
+            neg_idx = random.choice(candidates)
+            neg_user_embs.append(user_embs[idx])
+            neg_item_embs.append(pos_item_embs[neg_idx])
+            neg_labels.append(torch.zeros(1, dtype=torch.float32))
+
+    if neg_item_embs:
+        all_user_embs = torch.cat([user_embs, torch.stack(neg_user_embs)], dim=0)
+        all_item_embs = torch.cat([pos_item_embs, torch.stack(neg_item_embs)], dim=0)
+        all_labels = torch.cat([pos_labels, torch.stack(neg_labels).view(-1)], dim=0)
+    else:
+        all_user_embs, all_item_embs, all_labels =user_embs, pos_item_embs, pos_labels
+
+    return all_user_embs, all_item_embs, all_labels
+
 
 class CrossNetwork(nn.Module):
     def __init__(self, input_dim, num_layers=2):
@@ -60,30 +86,43 @@ class CrossNetwork(nn.Module):
     def forward(self, x0):
         x_l = x0
         for i in range(self.num_layers):
-            gate = (x_l * self.weights[i]).sum(dim=1, keepdim=True)
-            x_l = x0 * gate + self.biases[i] +x_l
+            gate = (x_l * self.weights[i]).sum(dim=1, keepdim=True) # (B, 1)
+            x_l = x0 * gate + self.biases[i] +x_l  # (B, D)
+        return x_l
 
 
-# Two tower model
 class TwoTowerModelCrossLayer(nn.Module):
-    def __init__(self, user_raw_dim, product_raw_dim, user_embed_dim=128,
+    def __init__(self, users_num, prod_num, cat_num, store_num, user_raw_dim, product_raw_dim, 
+                 cat_emb_dim=32, user_embed_dim=128,
                  product_embed_dim=128, deep_hidden_dim=256, cross_layers=2, 
                  use_deep=True):
         super().__init__()
         self.use_deep = use_deep
+        # learnable embeddings, convert the following 1D vector to cat_emb_dim D vector
+        self.user_id_emb = nn.Embedding(users_num, cat_emb_dim) #
+        self.product_id_emb = nn.Embedding(prod_num, cat_emb_dim)
+        self.cat_emb = nn.Embedding(cat_num, cat_emb_dim)
+        self.store_emb = nn.Embedding(store_num, cat_emb_dim)
+
+        # adjust the user and product raw dimension
+        self.user_in_dim = user_raw_dim -1 + cat_emb_dim
+        self.product_in_dim = product_raw_dim-3+cat_emb_dim*3
+
         self.user_tower = nn.Sequential(
-            nn.Linear(user_raw_dim, user_embed_dim),
+            nn.Linear(self.user_in_dim, user_embed_dim),
             nn.ReLU(),
             nn.Linear(user_embed_dim, user_embed_dim),
         )
         self.product_tower = nn.Sequential(
-            nn.Linear(product_raw_dim, product_embed_dim),
+            nn.Linear(self.product_in_dim, product_embed_dim),
             nn.ReLU(),
             nn.Linear(product_embed_dim, product_embed_dim)
         )
 
-        self.cross_input_dim = user_raw_dim + product_raw_dim
+        self.cross_input_dim = self.user_in_dim + self.product_in_dim
         self.cross = CrossNetwork(self.cross_input_dim, num_layers=cross_layers)
+
+
 
         if self.use_deep:
             self.deep_mlp = nn.Sequential(
@@ -95,8 +134,8 @@ class TwoTowerModelCrossLayer(nn.Module):
             final_input_dim = self.cross_input_dim + deep_hidden_dim + user_embed_dim + product_embed_dim
         else:
             # Final head
-            final_input_dim = self.cross_input_dim + deep_hidden_dim + user_embed_dim + product_embed_dim
-        self.pred = nn.Linear(final_input_dim)
+            final_input_dim = self.cross_input_dim  + user_embed_dim + product_embed_dim
+        self.pred = nn.Linear(final_input_dim, 1)
 
     def forward_user(self, x):
         return self.user_tower(x)
@@ -105,18 +144,50 @@ class TwoTowerModelCrossLayer(nn.Module):
         return self.product_tower(x)
 
     def forward(self, user_raw_feats, product_raw_feats):
-        user_embed = self.forward_user(user_raw_feats)
-        item_embed = self.forward_product(product_raw_feats)
+        # look up
+        user_idx = user_raw_feats[:, 0].long() #(B, )
+        user_cont = user_raw_feats[:, 1:] #(B, original_user_raw_dim -1)
+        user_id_e = self.user_id_emb(user_idx) # (B, cat_emb_dim)
+        # new user input
+        user_in = torch.cat([user_id_e, user_cont], dim=1) #(B, original_user_dim-1+cat_emb_idm)
 
+        # Item
+        p_idx = product_raw_feats[:, 0].long() #(B, )
+        cat_idx = product_raw_feats[:, 1].long() #(B, )
+        store_idx = product_raw_feats[:, 2].long() #(B, )
+        prod_cont = product_raw_feats[:, 3:]  #(B, original -3)
+
+        p_id_e = self.product_id_emb(p_idx)
+        cat_e = self.cat_emb(cat_idx)
+        store_e = self.store_emb(store_idx)
+        # new product input
+        product_in = torch.cat([p_id_e, cat_e, store_e, prod_cont], dim=1) # (B, original -3 + 3*cat_emb_dim) 
+
+        # --- pass through towers ---
+        # print(f"user_in.shape: {user_in.shape}")
+        # print(f"Excepted dim: {self.user_in_dim}")
+        user_embed = self.forward_user(user_in)        # (B, user_embed_dim)
+
+        # print(f"user_in.shape: {product_in.shape}")
+        # print(f"Excepted dim: {self.product_in_dim}")
+        item_embed = self.forward_product(product_in)  # (B, product_embed_dim)
+
+        # --- combine for cross & deep ---
         # Raw input concat
-        raw_concat = torch.cat([user_raw_feats, product_raw_feats], dim=1)
+        raw_concat = torch.cat([user_in, product_in], dim=1) #
 
         # CrossNet
         x_cross = self.cross(raw_concat)
 
+        # print("x_cross:", x_cross.shape)
+        
+        # print("user_embed:", user_embed.shape)
+        # print("item_embed:", item_embed.shape)
+
         # Optional deep MLP
         if self.use_deep:
             x_deep = self.deep_mlp(raw_concat)
+            # print("x_deep:", x_deep.shape if self.use_deep else "not used")
             final_input = torch.cat([x_cross, x_deep, user_embed, item_embed], dim=1)
         else:
             final_input = torch.cat([x_cross, user_embed, item_embed], dim=1)
@@ -154,235 +225,105 @@ def save_embeddings(model, user_feature_path, product_feature_path, path='./Data
     model.eval()
 
     # compute user embeddings
-    user_emb_list = []
-    user_ids = []
+    user_emb_dict = {}
     for user_id, vec in user_features.items():
-        x = torch.tensor(vec, dtype=torch.float32).unsqueeze(0) # [1, dim]
+        vec = torch.tensor(vec, dtype=torch.float32) # [D]
+        user_idx = vec[0].long().unsqueeze(0) # user_id index
+        user_cont = vec[1:].unsqueeze(0) # continuous part
+
         with torch.no_grad():
-            emb = model.forward_user(x).squeeze(0).cpu().numpy()
-        user_emb_list.append(emb)
-        user_ids.append(user_id)
-    
-    user_df = pd.DataFrame(user_emb_list, index=user_ids)
+            user_id_e = model.user_id_emb(user_idx) # [1, cat_emb_dim]
+            user_input = torch.cat([user_id_e, user_cont], dim=1) #[1, full_user_dim]
+            emb = model.forward_user(user_input).squeeze(0).cpu().numpy()
+        user_emb_dict[user_id] = emb
+    with open(os.path.join(path, 'user_embeddings_IncludeUid.pkl'), "wb") as f:
+        pickle.dump(user_emb_dict, f)
 
     # compute product embeddings
-    product_emb_list = []
-    product_ids = []
+    product_emb_dict = {}
     for product_id, vec in product_features.items():
-        x = torch.tensor(vec, dtype=torch.float32).unsqueeze(0)
+        vec = torch.tensor(vec, dtype=torch.float32)
+        p_idx = vec[0].long().unsqueeze(0)
+        cat_idx = vec[1].long().unsqueeze(0)
+        store_idx = vec[2].long().unsqueeze(0)
+        prod_cont = vec[3:].long().unsqueeze(0)
         with torch.no_grad():
-            emb = model.forward_product(x).squeeze(0).cpu().numpy()
-        product_emb_list.append(emb)
-        product_ids.append(product_id)
-    
-    product_df = pd.DataFrame(product_emb_list, index=product_ids)
+            p_id_e = model.product_id_emb(p_idx)
+            cat_e = model.cat_emb(cat_idx)
+            store_e = model.store_emb(store_idx)
+            product_input = torch.cat([p_id_e, cat_e, store_e, prod_cont], dim=1)
+            emb = model.forward_product(product_input).squeeze(0).cpu().numpy()
+        product_emb_dict[product_id] = emb
+    with open(os.path.join(path, 'product_embeddings_IncludePid.pkl'), "wb") as f:
+        pickle.dump(product_emb_dict, f)
 
-    user_df.to_csv(os.path.join(path, 'user_embeddings.csv'))
-    product_df.to_csv(os.path.join(path, 'product_embeddings.csv'))
-
-
-
-def recommend_top_k_products(user_id, user_emb_path, product_emb_path, k=5):
-    """
-    1. Loads the saved user and product embeddings from CSV.
-
-    2. Retrieves the embedding vector for a given user_id.
-
-    3. Computes cosine similarity between that user embedding and all product embeddings.
-
-    4. Returns the top 5 most similar product IDs
-    """
-    # Load embeddings
-    user_df = pd.read_csv(user_emb_path, index_col=0)
-    product_df = pd.read_csv(product_emb_path, index_col=0)
-
-    # Check if user_id exists
-    if user_id not in user_df.index:
-        raise ValueError(f"User ID '{user_id}' not found in user embeddings.")
-
-    # Get user embedding
-    # [user_id] (single brackets) returns a Series (1D vector).
-    # .values converts it to a 1D NumPy array: shape (embedding_dim,)
-    # .reshape(1, -1) manually reshapes it into a 2D array: shape (1, embedding_dim)
-    # This is more flexible if you want to do additional reshaping or operations manually
-    user_emb = user_df.loc[user_id].values.reshape(1, -1)
-
-    # Compute cosine similarity
-    sim_scores = cosine_similarity(user_emb, product_df.values)[0] # 2D array (1,N) 1 user, N products, get the row (first row)
-
-    # Get top-k product indices
-    # np.argsort(sim_scores) returns the indices that would sort the array in ascending order
-    # [::-1] reverses the order to get descending sort
-    top_k_idx = np.argsort(sim_scores)[::-1][:k]
-    top_k_products = product_df.index[top_k_idx]
-    top_k_scores = sim_scores[top_k_idx]
-
-    # Return as DataFrame
-    return pd.DataFrame({
-        'user_id': [user_id] * k, 
-        'product_id': top_k_products,
-        'similarity': top_k_scores
-    })
-
-
-def get_top_k_similar_products_for_users(user_ids, k=5, path='./Data'):
-    # Load embeddings
-    user_df = pd.read_csv(f"{path}/user_embeddings.csv", index_col=0)
-    product_df = pd.read_csv(f"{path}/product_embeddings.csv", index_col=0)
-
-    results = []
-
-    for user_id in user_ids:
-        if user_id not in user_df.index:
-            print(f"Warning: User ID '{user_id}' not found. Skipping.")
-            continue
-
-        # Get user embedding
-        # [[user_id]] (double brackets) means you’re selecting a DataFrame (not a Series).
-        # .values converts the DataFrame to a NumPy array.
-        # The result is automatically 2D: shape (1, embedding_dim).
-        user_emb = user_df.loc[[user_id]].values  # shape (1, embed_dim)
-
-        # Compute cosine similarity
-        sim_scores = cosine_similarity(user_emb, product_df.values)[0]
-
-        # Get top-k product indices
-        top_k_idx = np.argsort(sim_scores)[::-1][:k]
-        top_k_product_ids = product_df.index[top_k_idx]
-        top_k_scores = sim_scores[top_k_idx]
-
-        # Collect results
-        for pid, score in zip(top_k_product_ids, top_k_scores):
-            results.append({
-                'user_id': user_id,
-                'product_id': pid,
-                'similarity': score
-            })
-
-    result_df = pd.DataFrame(results)
-    return result_df
-
-
-
-
-# Evaluation
-def precision_recall_at_k(model, dataset, user_encoder, product_encoder, K=10):
-    model.eval()
-    
-    user_embeddings = model.user_embedding.weight.data  # [num_users, embed_dim]
-    product_embeddings = model.product_embedding.weight.data  # [num_products, embed_dim]
-    
-    # Normalize for cosine similarity
-    user_embeddings = nn.functional.normalize(user_embeddings, dim=1)
-    product_embeddings = nn.functional.normalize(product_embeddings, dim=1)
-    
-    precisions = []
-    recalls = []
-    
-    for user_id in np.unique(dataset.user_df['user_id']):
-        user_idx = user_encoder.transform([user_id])[0]
-        user_vec = user_embeddings[user_idx]  # [embed_dim]
-        
-        # Compute similarity with all products
-        scores = torch.matmul(product_embeddings, user_vec)
-        topk_indices = torch.topk(scores, K).indices.cpu().numpy()
-        topk_product_ids = product_encoder.inverse_transform(topk_indices)
-        
-        # Get actual products this user bought (in dataset)
-        actual_bought = dataset.user_df[
-            (dataset.user_df['user_id'] == user_id) & 
-            (dataset.labels == 1)
-        ]['parent_asin'].unique()
-        
-        if len(actual_bought) == 0:
-            continue
-        
-        # Compute Precision@K and Recall@K
-        hits = len(set(actual_bought) & set(topk_product_ids))
-        precision = hits / K
-        recall = hits / len(actual_bought)
-        
-        precisions.append(precision)
-        recalls.append(recall)
-    
-    avg_precision = np.mean(precisions)
-    avg_recall = np.mean(recalls)
-    
-    print(f"Precision@{K}: {avg_precision:.4f}, Recall@{K}: {avg_recall:.4f}")
-
-# Inference: Recommend Top-K Products for a User
-def recommend_products(model, user_id, user_encoder, product_encoder, product_df, K=10):
-    model.eval()
-    
-    if user_id not in user_encoder.classes_:
-        print("User not found!")
-        return []
-
-    user_idx = torch.tensor(user_encoder.transform([user_id]), dtype=torch.long)
-    user_vec = model.user_embedding(user_idx).squeeze(0)
-    user_vec = nn.functional.normalize(user_vec, dim=0)
-
-    product_embeddings = model.product_embedding.weight.data
-    product_embeddings = nn.functional.normalize(product_embeddings, dim=1)
-
-    scores = torch.matmul(product_embeddings, user_vec)
-    topk_indices = torch.topk(scores, K).indices.cpu().numpy()
-    topk_product_ids = product_encoder.inverse_transform(topk_indices)
-
-    return product_df[product_df['parent_asin'].isin(topk_product_ids)][['title', 'price', 'parent_asin']]
 
 
 if __name__ == "__main__":
-    # # full pipline
-    # # Load and merge data
-    # user_df = pd.read_excel("Data/top30k_user.xlsx")
-    # product_df = pd.read_excel("Data/top30k.xlsx")
+    # full pipline
+    # Load and merge data
+    user_df = pd.read_excel("Data/top30k_user.xlsx")
+    product_df = pd.read_excel("Data/top30k.xlsx")
 
-    # user_feature_path = "Data/user_features.pkl"
-    # product_feature_path = "Data/product_features.pkl"
-    # dataset = AmazonDataset(user_df, product_df, user_feature_path, product_feature_path)
+    user_feature_path = "Data/user_features_IncludeUid.pkl"
+    product_feature_path = "Data/product_features_IncludePid.pkl"
 
-    # print(np.unique(dataset.labels, return_counts=True))
+    with open(user_feature_path, "rb") as f:
+        user_features = pickle.load(f)
+    with open(product_feature_path, 'rb') as f:
+        product_features = pickle.load(f)
 
-    # missing_users = sum(user_id not in dataset.user_features for user_id in user_df['user_id'])
-    # missing_products = sum(pid not in dataset.product_features for pid in user_df['parent_asin'])
+    user_codes = [vec[0] for vec in user_features.values()]
+    users_num = len(set(user_codes))
 
-    # print(f"Missing users: {missing_users}/{len(user_df)}")
-    # print(f"Missing products: {missing_products}/{len(user_df)}")
-
-    # dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
-
-    # #Get feature dims from first sample
-    # user_feat_dim = len(next(iter(dataset))[0])
-    # product_feat_dim = len(next(iter(dataset))[1])
-
-    # # Init model
-    # model = TwoTowerModel(
-    #     user_dim=user_feat_dim,
-    #     product_dim=product_feat_dim,
-    #     hidden_dim=128
-    # )
-
-    # # Optimizer and Loss
-    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    # criterion = nn.BCEWithLogitsLoss()
-
-    # # Train
-    # train_model(model, dataloader, optimizer, criterion, epochs=10)
-
-    # # Save embeddings
-    # save_embeddings(model, user_feature_path, product_feature_path)
+    prod_codes, cat_codes, store_codes = zip(*[(vec[0], vec[1], vec[2]) for vec in product_features.values()])
+    prod_num = len(set(prod_codes))
+    cat_num = len(set(cat_codes))
+    store_num = len(set(store_codes))
 
 
-    # # Example usage
-    top_k = recommend_top_k_products(
-        user_id='AHZZLN7P67CN7L4RODX665VBYQXQ',
-        user_emb_path='./Data/user_embeddings.csv',
-        product_emb_path='./Data/product_embeddings.csv',
-        k=5
+    dataset = AmazonDataset(user_df, product_df, user_features, product_features)
+
+    print(np.unique(dataset.labels, return_counts=True))
+
+    missing_users = sum(user_id not in dataset.user_features for user_id in user_df['user_id'])
+    missing_products = sum(pid not in dataset.product_features for pid in user_df['parent_asin'])
+
+    print(f"Missing users: {missing_users}/{len(user_df)}")
+    print(f"Missing products: {missing_products}/{len(user_df)}")
+
+    batch_size =64
+    neg_k =2
+    #dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
+    dataloader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True,
+                        collate_fn=lambda b: rec_collate_fn(b,  neg_k=neg_k))
+
+    #Get feature dims from first sample
+    user_feat_dim = len(next(iter(dataset))[1])
+    product_feat_dim = len(next(iter(dataset))[2])
+
+    # Init model
+    model = TwoTowerModelCrossLayer(
+        users_num = users_num,
+        prod_num = prod_num,
+        cat_num =cat_num,
+        store_num =store_num,
+        user_raw_dim=user_feat_dim,
+        product_raw_dim=product_feat_dim
     )
-    top_k.to_excel("Top5SimilarProductsV2.xlsx")
-    print(top_k)
+
+    # Optimizer and Loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.BCEWithLogitsLoss()
+
+    # Train
+    print(f"----- Training model -----------")
+    train_model(model, dataloader, optimizer, criterion, epochs=10)
+
+    print(f"--------- saving embeddings ---------")
+    # Save embeddings
+    save_embeddings(model, user_feature_path, product_feature_path)
+
 
     # # Evaluate model
     # precision_recall_at_k(model, dataset, dataset.user_encoder, dataset.product_encoder, K=10)
